@@ -3,7 +3,7 @@ name: Generate and Update M3U Playlist
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 * * * *'  # Her saat başı çalışacak şekilde ayarlandı
+    - cron: '0 * * * *'  # Her saat başı çalışacak
 
 env:
   MAIN_URL: "https://m.prectv51.sbs"
@@ -42,32 +42,31 @@ jobs:
         SW_KEY = os.environ.get('SW_KEY')
         AUTH_TOKEN = os.environ.get('AUTH_TOKEN')
         
-        HEADERS = {
+        # API isteklerinde kullanılacak headers
+        API_HEADERS = {
             "User-Agent": "okhttp/4.12.0",
             "Referer": "https://twitter.com/",
             "Authorization": f"Bearer {AUTH_TOKEN}"
         }
 
-        def get_fresh_token():
+        # M3U dosyasına yazılacak sabit headers
+        M3U_HEADERS = {
+            "User-Agent": "googleusercontent",
+            "Referer": "https://twitter.com/",
+            "Origin": "https://twitter.com"
+        }
+
+        def get_token_expiry():
             try:
-                # Token'ın geçerlilik süresini kontrol et
                 decoded = jwt.decode(AUTH_TOKEN, options={"verify_signature": False})
-                exp = decoded.get('exp', 0)
-                if datetime.datetime.now().timestamp() > exp:
-                    print("Token expired, need to refresh")
-                    # Burada token yenileme mantığı eklenmeli
-                    # Şimdilik orijinal token'i döndürüyoruz
-                return AUTH_TOKEN
+                return decoded.get('exp', 0)
             except Exception as e:
                 print(f"Token decode error: {e}")
-                return AUTH_TOKEN
+                return 0
 
         def fetch_url(url, is_live=False):
             try:
-                headers = HEADERS.copy()
-                if is_live:
-                    headers["Authorization"] = f"Bearer {get_fresh_token()}"
-                
+                headers = API_HEADERS.copy()
                 response = requests.get(url, headers=headers, timeout=20)
                 if response.status_code == 404:
                     return None
@@ -126,16 +125,9 @@ jobs:
                 for s in channel.get('sources', []):
                     if isinstance(s, dict) and s.get('type') == 'm3u8' and s.get('url'):
                         clean_title = channel.get('title', 'Unknown').split('(')[0].strip()
-                        
-                        # Token'ı URL'ye ekle
-                        url = s.get('url')
-                        if '?' in url:
-                            url += f"&token={get_fresh_token()}"
-                        else:
-                            url += f"?token={get_fresh_token()}"
-                            
+                        # URL'yi olduğu gibi bırakıyoruz, değiştirmiyoruz
                         m3u8_sources.append({
-                            'url': url,
+                            'url': s.get('url'),
                             'clean_title': clean_title
                         })
                 
@@ -205,10 +197,21 @@ jobs:
         def generate_m3u():
             print("\nStarting playlist generation...")
             
+            # Token süresi kontrolü
+            token_expiry = get_token_expiry()
+            expiry_time = datetime.datetime.fromtimestamp(token_expiry)
+            now = datetime.datetime.now()
+            
+            print(f"\nToken expiry: {expiry_time} (in {(expiry_time - now).total_seconds()/60:.1f} minutes)")
+            
+            if now > expiry_time:
+                print("WARNING: Token has expired! Playlist may not work properly.")
+            
             with open("playlist.m3u", "w", encoding="utf-8") as f:
                 f.write("#EXTM3U\n")
                 f.write(f"# Generated at: {datetime.datetime.now()}\n")
-                f.write(f"# API Source: {MAIN_URL}\n\n")
+                f.write(f"# API Source: {MAIN_URL}\n")
+                f.write(f"# Token Expiry: {expiry_time}\n\n")
                 
                 # 1. CANLI YAYINLAR
                 print("\nProcessing Live Channels...")
@@ -229,9 +232,9 @@ jobs:
                             
                             if url:
                                 f.write(f'#EXTINF:-1 tvg-id="{channel.get("id", "")}" tvg-name="{name}" tvg-logo="{image}" group-title="{category}",{name}\n')
-                                f.write(f'#EXTVLCOPT:http-user-agent=googleusercontent\n')
-                                f.write(f'#EXTVLCOPT:http-referrer=https://twitter.com/\n')
-                                f.write(f'#EXTVLCOPT:http-origin=https://twitter.com\n')
+                                f.write(f'#EXTVLCOPT:http-user-agent={M3U_HEADERS["User-Agent"]}\n')
+                                f.write(f'#EXTVLCOPT:http-referrer={M3U_HEADERS["Referer"]}\n')
+                                f.write(f'#EXTVLCOPT:http-origin={M3U_HEADERS["Origin"]}\n')
                                 f.write(f"{url}\n\n")
                 
                 # 2. FİLMLER
@@ -252,9 +255,9 @@ jobs:
                         
                         if url:
                             f.write(f'#EXTINF:-1 tvg-id="{movie.get("id", "")}" tvg-name="{name}" tvg-logo="{image}" group-title="{category}",{name}\n')
-                            f.write(f'#EXTVLCOPT:http-user-agent=googleusercontent\n')
-                            f.write(f'#EXTVLCOPT:http-referrer=https://twitter.com/\n')
-                            f.write(f'#EXTVLCOPT:http-origin=https://twitter.com\n')
+                            f.write(f'#EXTVLCOPT:http-user-agent={M3U_HEADERS["User-Agent"]}\n')
+                            f.write(f'#EXTVLCOPT:http-referrer={M3U_HEADERS["Referer"]}\n')
+                            f.write(f'#EXTVLCOPT:http-origin={M3U_HEADERS["Origin"]}\n')
                             f.write(f"{url}\n\n")
                 
                 # 3. DİZİLER
@@ -302,9 +305,9 @@ jobs:
                                             added_episodes.add(ep_id)
                                             ep_name = f"{serie_name} S{season_num}E{episode_num}"
                                             f.write(f'#EXTINF:-1 tvg-id="{episode.get("id", "")}" tvg-name="{ep_name}" tvg-logo="{serie_image}" group-title="{category}",{ep_name}\n')
-                                            f.write(f'#EXTVLCOPT:http-user-agent=googleusercontent\n')
-                                            f.write(f'#EXTVLCOPT:http-referrer=https://twitter.com/\n')
-                                            f.write(f'#EXTVLCOPT:http-origin=https://twitter.com\n')
+                                            f.write(f'#EXTVLCOPT:http-user-agent={M3U_HEADERS["User-Agent"]}\n')
+                                            f.write(f'#EXTVLCOPT:http-referrer={M3U_HEADERS["Referer"]}\n')
+                                            f.write(f'#EXTVLCOPT:http-origin={M3U_HEADERS["Origin"]}\n')
                                             f.write(f"{url}\n\n")
             
             print("\nPlaylist generation completed successfully!")
