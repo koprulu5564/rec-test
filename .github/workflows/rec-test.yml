@@ -1,0 +1,308 @@
+name: Generate and Update M3U Playlist
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 0 * * *'
+
+env:
+  MAIN_URL: "https://m.prectv51.sbs"
+  SW_KEY: "4F5A9C3D9A86FA54EACEDDD635185/c3c5bd17-e37b-4b94-a944-8a3688a30452"
+
+jobs:
+  generate-m3u:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+        
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install requests tqdm
+
+    - name: Generate M3U playlist
+      run: |
+        cat << 'EOF' > generate_playlist.py
+        import requests
+        import datetime
+        import os
+        from tqdm import tqdm
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        MAIN_URL = os.environ.get('MAIN_URL').strip('/')
+        SW_KEY = os.environ.get('SW_KEY')
+        
+        HEADERS = {
+            "User-Agent": "okhttp/4.12.0",
+            "Referer": "https://twitter.com/",
+            "Origin": "https://twitter.com"
+        }
+
+        def fetch_url(url):
+            try:
+                response = requests.get(url, headers=HEADERS, timeout=20)
+                if response.status_code == 404:
+                    return None
+                response.raise_for_status()
+                return response.json()
+            except Exception as e:
+                print(f"Error fetching {url}: {e}")
+                return None
+
+        def get_all_pages(base_url, category_name):
+            print(f"\nFetching {category_name}...")
+            all_items = []
+            page = 0
+            
+            with tqdm(desc=category_name) as pbar:
+                while True:
+                    url = f"{base_url}{page}/{SW_KEY}/"
+                    data = fetch_url(url)
+                    
+                    if not data or not isinstance(data, list):
+                        break
+                        
+                    if len(data) == 0:
+                        break
+                        
+                    all_items.extend(data)
+                    page += 1
+                    pbar.update(1)
+                    pbar.set_postfix({'Page': page, 'Items': len(all_items)})
+            
+            print(f"Total {len(all_items)} items found for {category_name}")
+            return all_items
+
+        def get_live_channels():
+            print("\nFetching live channels with categories...")
+            base_url = f"{MAIN_URL}/api/channel/by/filtres/0/0/"
+            all_channels = get_all_pages(base_url, "Canlı Yayınlar")
+            
+            # API'den gelen kategori bilgilerine göre grupla
+            categories = {}
+            for channel in all_channels:
+                if not isinstance(channel, dict):
+                    continue
+                    
+                # API'den kategori bilgisini al
+                channel_categories = channel.get('categories', [])
+                if not channel_categories:
+                    continue
+                
+                category_name = channel_categories[0].get('title')
+                if not category_name:
+                    continue
+                
+                if category_name not in categories:
+                    categories[category_name] = []
+                
+                # Sadece m3u8 kaynaklarını filtrele ve gereksiz bilgileri temizle
+                m3u8_sources = []
+                for s in channel.get('sources', []):
+                    if isinstance(s, dict) and s.get('type') == 'm3u8' and s.get('url'):
+                        # Kaynak başlığını temizle (parantez içindekileri kaldır)
+                        clean_title = channel.get('title', 'Unknown').split('(')[0].strip()
+                        m3u8_sources.append({
+                            'url': s.get('url'),
+                            'clean_title': clean_title
+                        })
+                
+                if m3u8_sources:
+                    channel['filtered_sources'] = m3u8_sources
+                    categories[category_name].append(channel)
+            
+            return categories
+
+        def get_movies():
+            movie_categories = [
+                (0, "Son Eklenen Filmler"),
+                (14, "Aile Filmleri"),
+                (1, "Aksiyon Filmleri"),
+                (13, "Animasyon Filmleri"),
+                (19, "Belgesel Filmleri"),
+                (4, "Bilim Kurgu Filmleri"),
+                (2, "Dram Filmleri"),
+                (10, "Fantastik Filmler"),
+                (3, "Komedi Filmleri"),
+                (8, "Korku Filmleri"),
+                (17, "Macera Filmleri"),
+                (5, "Romantik Filmler")
+            ]
+            
+            results = {}
+            with ThreadPoolExecutor() as executor:
+                futures = []
+                for cat_id, cat_name in movie_categories:
+                    base_url = f"{MAIN_URL}/api/movie/by/filtres/{cat_id}/created/"
+                    futures.append(executor.submit(get_all_pages, base_url, cat_name))
+                
+                for future, (cat_id, cat_name) in zip(as_completed(futures), movie_categories):
+                    results[cat_name] = future.result()
+            
+            return results
+
+        def get_series():
+            series_categories = [
+                (0, "Son Eklenen Diziler"),
+                (1, "Aksiyon Dizileri"),
+                (2, "Dram Dizileri"),
+                (3, "Komedi Dizileri"),
+                (4, "Bilim Kurgu Dizileri"),
+                (5, "Polisiye Diziler"),
+                (6, "Romantik Diziler"),
+                (7, "Tarih Dizileri")
+            ]
+            
+            results = {}
+            with ThreadPoolExecutor() as executor:
+                futures = []
+                for cat_id, cat_name in series_categories:
+                    base_url = f"{MAIN_URL}/api/serie/by/filtres/{cat_id}/created/"
+                    futures.append(executor.submit(get_all_pages, base_url, cat_name))
+                
+                for future, (cat_id, cat_name) in zip(as_completed(futures), series_categories):
+                    results[cat_name] = future.result()
+            
+            return results
+
+        def get_episodes(series_id):
+            url = f"{MAIN_URL}/api/season/by/serie/{series_id}/{SW_KEY}/"
+            data = fetch_url(url)
+            return data if isinstance(data, list) else []
+
+        def generate_m3u():
+            print("\nStarting playlist generation...")
+            
+            with open("playlist.m3u", "w", encoding="utf-8") as f:
+                f.write("#EXTM3U\n")
+                f.write(f"# Generated at: {datetime.datetime.now()}\n")
+                f.write(f"# API Source: {MAIN_URL}\n\n")
+                
+                # 1. CANLI YAYINLAR
+                print("\nProcessing Live Channels...")
+                live_data = get_live_channels()
+                for category, channels in live_data.items():
+                    if not channels:
+                        continue
+                    
+                    f.write(f'#EXTINF:-1 group-title="{category}",{category}\n')
+                    for channel in channels:
+                        if not isinstance(channel, dict) or not channel.get('filtered_sources'):
+                            continue
+                            
+                        for source in channel['filtered_sources']:
+                            name = source['clean_title']  # Temizlenmiş başlık
+                            image = channel.get('image', '')
+                            url = source.get('url', '')
+                            
+                            if url:
+                                f.write(f'#EXTINF:-1 tvg-id="{channel.get("id", "")}" tvg-name="{name}" tvg-logo="{image}" group-title="{category}",{name}\n')
+                                f.write(f'#EXTVLCOPT:http-user-agent=googleusercontent\n')
+                                f.write(f'#EXTVLCOPT:http-referrer=https://twitter.com/\n')
+                                f.write(f'#EXTVLCOPT:http-origin=https://twitter.com\n')
+                                f.write(f"{url}\n\n")
+                
+                # 2. FİLMLER
+                print("\nProcessing Movies...")
+                movie_data = get_movies()
+                for category, movies in movie_data.items():
+                    if not movies:
+                        continue
+                    
+                    f.write(f'#EXTINF:-1 group-title="{category}",{category}\n')
+                    for movie in movies:
+                        if not isinstance(movie, dict) or not movie.get('sources'):
+                            continue
+                            
+                        name = movie.get('title', 'Unknown')
+                        image = movie.get('image', '')
+                        url = movie['sources'][0].get('url', '')
+                        
+                        if url:
+                            f.write(f'#EXTINF:-1 tvg-id="{movie.get("id", "")}" tvg-name="{name}" tvg-logo="{image}" group-title="{category}",{name}\n')
+                            f.write(f'#EXTVLCOPT:http-user-agent=googleusercontent\n')
+                            f.write(f'#EXTVLCOPT:http-referrer=https://twitter.com/\n')
+                            f.write(f'#EXTVLCOPT:http-origin=https://twitter.com\n')
+                            f.write(f"{url}\n\n")
+                
+                # 3. DİZİLER (Tekrar eden bölümler için düzenleme yapıldı)
+                print("\nProcessing Series...")
+                series_data = get_series()
+                for category, series in series_data.items():
+                    if not series:
+                        continue
+                    
+                    f.write(f'#EXTINF:-1 group-title="{category}",{category}\n')
+                    
+                    with ThreadPoolExecutor() as executor:
+                        futures = []
+                        for serie in series:
+                            if not isinstance(serie, dict) or not serie.get('id'):
+                                continue
+                                
+                            futures.append(executor.submit(get_episodes, serie['id']))
+                        
+                        # Tekrar eden bölümleri engellemek için kontrol
+                        added_episodes = set()
+                        
+                        for future, serie in zip(as_completed(futures), series):
+                            episodes = future.result()
+                            if not episodes:
+                                continue
+                                
+                            serie_name = serie.get('title', 'Unknown')
+                            serie_image = serie.get('image', '')
+                            
+                            for season in episodes:
+                                if not isinstance(season, dict) or not season.get('episodes'):
+                                    continue
+                                    
+                                for episode in season['episodes']:
+                                    if not isinstance(episode, dict) or not episode.get('sources'):
+                                        continue
+                                        
+                                    url = episode['sources'][0].get('url', '')
+                                    if url:
+                                        # Sezon ve bölüm bilgisini düzgün formatla
+                                        season_title = season.get('title', '')
+                                        episode_title = episode.get('title', '')
+                                        
+                                        # Sezon ve bölüm numaralarını çıkar
+                                        season_num = ''.join(filter(str.isdigit, season_title)) or '0'
+                                        episode_num = ''.join(filter(str.isdigit, episode_title)) or '0'
+                                        
+                                        ep_id = f"{serie_name}-S{season_num}E{episode_num}"
+                                        
+                                        # Eğer bu bölüm daha önce eklenmediyse
+                                        if ep_id not in added_episodes:
+                                            added_episodes.add(ep_id)
+                                            ep_name = f"{serie_name} S{season_num}E{episode_num}"
+                                            f.write(f'#EXTINF:-1 tvg-id="{episode.get("id", "")}" tvg-name="{ep_name}" tvg-logo="{serie_image}" group-title="{category}",{ep_name}\n')
+                                            f.write(f'#EXTVLCOPT:http-user-agent=googleusercontent\n')
+                                            f.write(f'#EXTVLCOPT:http-referrer=https://twitter.com/\n')
+                                            f.write(f'#EXTVLCOPT:http-origin=https://twitter.com\n')
+                                            f.write(f"{url}\n\n")
+            
+            print("\nPlaylist generation completed successfully!")
+
+        if __name__ == "__main__":
+            generate_m3u()
+        EOF
+        
+        python generate_playlist.py
+        
+    - name: Commit and push changes
+      if: success()
+      run: |
+        git config --global user.name "GitHub Actions"
+        git config --global user.email "actions@github.com"
+        git add playlist.m3u
+        git diff --quiet && git diff --staged --quiet || git commit -m "Update M3U playlist [auto]"
+        git push
