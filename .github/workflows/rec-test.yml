@@ -3,11 +3,12 @@ name: Generate and Update M3U Playlist
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 0 * * *'
+    - cron: '0 * * * *'  # Her saat başı çalışacak şekilde ayarlandı
 
 env:
   MAIN_URL: "https://m.prectv51.sbs"
   SW_KEY: "4F5A9C3D9A86FA54EACEDDD635185/c3c5bd17-e37b-4b94-a944-8a3688a30452"
+  AUTH_TOKEN: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJhcHAiLCJwa2ciOiJjb20ucmVjdHYuc2hvdCIsImlhdCI6MTc1NTU1MjkxNSwiZXhwIjoxNzU1NTUzMDM1fQ.DYrbhnVIRrh86Lv-JEM2M0Rs6GrEkwlhA0lpGA9rehA"
 
 jobs:
   generate-m3u:
@@ -25,7 +26,7 @@ jobs:
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install requests tqdm
+        pip install requests tqdm pyjwt
 
     - name: Generate M3U playlist
       run: |
@@ -33,20 +34,41 @@ jobs:
         import requests
         import datetime
         import os
+        import jwt
         from tqdm import tqdm
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
         MAIN_URL = os.environ.get('MAIN_URL').strip('/')
         SW_KEY = os.environ.get('SW_KEY')
+        AUTH_TOKEN = os.environ.get('AUTH_TOKEN')
         
         HEADERS = {
             "User-Agent": "okhttp/4.12.0",
-            "Referer": "https://twitter.com/"
+            "Referer": "https://twitter.com/",
+            "Authorization": f"Bearer {AUTH_TOKEN}"
         }
 
-        def fetch_url(url):
+        def get_fresh_token():
             try:
-                response = requests.get(url, headers=HEADERS, timeout=20)
+                # Token'ın geçerlilik süresini kontrol et
+                decoded = jwt.decode(AUTH_TOKEN, options={"verify_signature": False})
+                exp = decoded.get('exp', 0)
+                if datetime.datetime.now().timestamp() > exp:
+                    print("Token expired, need to refresh")
+                    # Burada token yenileme mantığı eklenmeli
+                    # Şimdilik orijinal token'i döndürüyoruz
+                return AUTH_TOKEN
+            except Exception as e:
+                print(f"Token decode error: {e}")
+                return AUTH_TOKEN
+
+        def fetch_url(url, is_live=False):
+            try:
+                headers = HEADERS.copy()
+                if is_live:
+                    headers["Authorization"] = f"Bearer {get_fresh_token()}"
+                
+                response = requests.get(url, headers=headers, timeout=20)
                 if response.status_code == 404:
                     return None
                 response.raise_for_status()
@@ -55,7 +77,7 @@ jobs:
                 print(f"Error fetching {url}: {e}")
                 return None
 
-        def get_all_pages(base_url, category_name):
+        def get_all_pages(base_url, category_name, is_live=False):
             print(f"\nFetching {category_name}...")
             all_items = []
             page = 0
@@ -63,7 +85,7 @@ jobs:
             with tqdm(desc=category_name) as pbar:
                 while True:
                     url = f"{base_url}{page}/{SW_KEY}/"
-                    data = fetch_url(url)
+                    data = fetch_url(url, is_live)
                     
                     if not data or not isinstance(data, list):
                         break
@@ -82,15 +104,13 @@ jobs:
         def get_live_channels():
             print("\nFetching live channels with categories...")
             base_url = f"{MAIN_URL}/api/channel/by/filtres/0/0/"
-            all_channels = get_all_pages(base_url, "Canlı Yayınlar")
+            all_channels = get_all_pages(base_url, "Canlı Yayınlar", is_live=True)
             
-            # API'den gelen kategori bilgilerine göre grupla
             categories = {}
             for channel in all_channels:
                 if not isinstance(channel, dict):
                     continue
                     
-                # API'den kategori bilgisini al
                 channel_categories = channel.get('categories', [])
                 if not channel_categories:
                     continue
@@ -102,14 +122,20 @@ jobs:
                 if category_name not in categories:
                     categories[category_name] = []
                 
-                # Sadece m3u8 kaynaklarını filtrele ve gereksiz bilgileri temizle
                 m3u8_sources = []
                 for s in channel.get('sources', []):
                     if isinstance(s, dict) and s.get('type') == 'm3u8' and s.get('url'):
-                        # Kaynak başlığını temizle (parantez içindekileri kaldır)
                         clean_title = channel.get('title', 'Unknown').split('(')[0].strip()
+                        
+                        # Token'ı URL'ye ekle
+                        url = s.get('url')
+                        if '?' in url:
+                            url += f"&token={get_fresh_token()}"
+                        else:
+                            url += f"?token={get_fresh_token()}"
+                            
                         m3u8_sources.append({
-                            'url': s.get('url'),
+                            'url': url,
                             'clean_title': clean_title
                         })
                 
@@ -197,7 +223,7 @@ jobs:
                             continue
                             
                         for source in channel['filtered_sources']:
-                            name = source['clean_title']  # Temizlenmiş başlık
+                            name = source['clean_title']
                             image = channel.get('image', '')
                             url = source.get('url', '')
                             
@@ -231,7 +257,7 @@ jobs:
                             f.write(f'#EXTVLCOPT:http-origin=https://twitter.com\n')
                             f.write(f"{url}\n\n")
                 
-                # 3. DİZİLER (Tekrar eden bölümler için düzenleme yapıldı)
+                # 3. DİZİLER
                 print("\nProcessing Series...")
                 series_data = get_series()
                 for category, series in series_data.items():
@@ -248,7 +274,6 @@ jobs:
                                 
                             futures.append(executor.submit(get_episodes, serie['id']))
                         
-                        # Tekrar eden bölümleri engellemek için kontrol
                         added_episodes = set()
                         
                         for future, serie in zip(as_completed(futures), series):
@@ -269,17 +294,10 @@ jobs:
                                         
                                     url = episode['sources'][0].get('url', '')
                                     if url:
-                                        # Sezon ve bölüm bilgisini düzgün formatla
-                                        season_title = season.get('title', '')
-                                        episode_title = episode.get('title', '')
-                                        
-                                        # Sezon ve bölüm numaralarını çıkar
-                                        season_num = ''.join(filter(str.isdigit, season_title)) or '0'
-                                        episode_num = ''.join(filter(str.isdigit, episode_title)) or '0'
-                                        
+                                        season_num = ''.join(filter(str.isdigit, season.get('title', ''))) or '0'
+                                        episode_num = ''.join(filter(str.isdigit, episode.get('title', ''))) or '0'
                                         ep_id = f"{serie_name}-S{season_num}E{episode_num}"
                                         
-                                        # Eğer bu bölüm daha önce eklenmediyse
                                         if ep_id not in added_episodes:
                                             added_episodes.add(ep_id)
                                             ep_name = f"{serie_name} S{season_num}E{episode_num}"
