@@ -41,8 +41,7 @@ jobs:
         
         HEADERS = {
             "User-Agent": "okhttp/4.12.0",
-            "Referer": "https://twitter.com/",
-            "Origin": "https://twitter.com"
+            "Referer": "https://twitter.com/"
         }
 
         def fetch_url(url):
